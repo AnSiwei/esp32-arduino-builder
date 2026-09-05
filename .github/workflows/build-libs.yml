@@ -222,7 +222,6 @@ jobs:
           # 正确修复：从 CMakeLists.txt 中删掉对 vendor_host.c 的引用，而非 pin 旧版本。
           sed -i '/vendor_host\.c/d' components/arduino_tinyusb/CMakeLists.txt
           echo "CMakeLists.txt patched: removed vendor_host.c reference"
-          # ESP-IDF v5.5 默认使用 newlib。Arduino 3.3.11 的预编译库和
           # pioarduino-build.py 使用 picolibc multilib；显式把配置追加到
           # lib-builder 的公共 defconfig。build.sh 的额外参数只对 -b 非 all
           # 构建生效，直接把 CONFIG_*=y 作为 build.sh 参数不会作用于默认的
