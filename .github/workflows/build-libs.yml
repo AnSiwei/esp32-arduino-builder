@@ -41,6 +41,8 @@ jobs:
     steps:
       - name: 检出平台仓库
         run: |
+          git init
+          git remote add origin https://github.com/AnSiwei/esp32-arduino-builder.git
           git fetch origin develop
           git checkout -b develop origin/develop
 
