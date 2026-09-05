@@ -1,0 +1,672 @@
+name: Build ESP32 Arduino Libs
+
+# GitHub Actions 需要 contents: write 权限才能创建 release、上传 asset 以及
+# 将 .last_build_versions / platform.json 推回仓库。
+permissions:
+  contents: write
+
+# 触发方式：
+# 1. schedule: 每 24 小时检查一次上游 arduino-esp32 是否有更新，有则自动编译
+# 2. workflow_dispatch: 支持手动触发（可指定目标芯片和版本）
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: '目标芯片（逗号分隔）'
+        required: false
+        default: 'esp32,esp32s2,esp32s3,esp32c2,esp32c3,esp32c5,esp32c6,esp32c61,esp32h2,esp32p4'
+      arduino_version:
+        description: 'arduino-esp32 版本（auto = 自动检测最新 release）'
+        required: false
+        default: 'auto'
+      idf_version:
+        description: 'ESP-IDF 版本（auto = 从 arduino release 标题提取）'
+        required: false
+        default: 'auto'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/esp32-arduino-lib-builder:release-v5.5
+    env:
+      # Reuse the lock file and local component cache during repeated CMake configure
+      # steps. Without this, the final esp32 bootloader configure may query the registry
+      # again and fail after a long build when the registry/proxy has a transient outage.
+      IDF_COMPONENT_CHECK_NEW_VERSION: "0"
+      IDF_COMPONENT_CACHE_HTTP_REQUESTS: "1"
+      IDF_COMPONENT_API_TIMEOUT: "120"
+    steps:
+      - name: 检出平台仓库
+        run: |
+          git fetch origin develop
+          git checkout -b develop origin/develop
+
+      - name: 解析版本
+        id: ver
+        run: |
+          AR_INPUT="${{ github.event.inputs.arduino_version || 'auto' }}"
+          IDF_INPUT="${{ github.event.inputs.idf_version || 'auto' }}"
+
+          # ---- arduino-esp32 版本 ----
+          if [ "$AR_INPUT" = "auto" ]; then
+            # git ls-remote 列出所有 tag，筛选纯数字版本号，sort -V 取最新
+            AR_VERSION=$(git ls-remote --tags --refs https://github.com/espressif/arduino-esp32.git \
+              | grep -oP 'refs/tags/\K[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V | tail -1)
+            if [ -z "$AR_VERSION" ]; then
+              echo "❌ 无法获取 arduino-esp32 最新版本"
+              exit 1
+            fi
+            echo "arduino 来源: 自动检测 (git ls-remote)"
+          else
+            AR_VERSION="$AR_INPUT"
+            echo "arduino 来源: 手动指定"
+          fi
+          echo "arduino_version=$AR_VERSION" >> "$GITHUB_OUTPUT"
+          echo "arduino-esp32 版本: $AR_VERSION"
+
+          # ---- ESP-IDF 版本 ----
+          if [ "$IDF_INPUT" = "auto" ]; then
+            # 从 arduino-esp32 release 页面提取配套 ESP-IDF 版本
+            # 用 HTML 页面代替 API，避免 GitHub API 速率限制（未认证 60次/小时）
+            # 标题格式: "Arduino Release v3.3.11 based on ESP-IDF v5.5.5"
+            RELEASE_HTML=$(curl -sL --max-time 30 "https://github.com/espressif/arduino-esp32/releases/tag/$AR_VERSION" || echo "")
+            if [ -z "$RELEASE_HTML" ]; then
+              echo "❌ 无法获取 arduino-esp32 release 页面"
+              exit 1
+            fi
+            IDF_VERSION=$(echo "$RELEASE_HTML" | grep -oP 'based on ESP-IDF \Kv[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+            if [ -z "$IDF_VERSION" ]; then
+              # 标题没匹配到，尝试从页面内容匹配
+              IDF_VERSION=$(echo "$RELEASE_HTML" | grep -oiP 'esp-idf\s+v?\K[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+              if [ -n "$IDF_VERSION" ]; then
+                IDF_VERSION="v$IDF_VERSION"
+              fi
+            fi
+            if [ -z "$IDF_VERSION" ]; then
+              echo "❌ 无法从 arduino-esp32 release 页面中提取 ESP-IDF 版本"
+              exit 1
+            fi
+            echo "idf 来源: 自动提取 (arduino release 页面)"
+          else
+            IDF_VERSION="$IDF_INPUT"
+            echo "idf 来源: 手动指定"
+          fi
+          echo "idf_version=$IDF_VERSION" >> "$GITHUB_OUTPUT"
+          echo "ESP-IDF 版本: $IDF_VERSION"
+
+          # ---- 从 IDF tag 自动推导分支 ----
+          # v5.5.5 → release/v5.5
+          IDF_BRANCH=$(echo "$IDF_VERSION" | grep -oP '^v\K[0-9]+\.[0-9]+')
+          IDF_BRANCH="release/v$IDF_BRANCH"
+          echo "idf_branch=$IDF_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "ESP-IDF 分支: $IDF_BRANCH"
+
+      - name: 确定构建目标及发布状态
+        id: targets
+        env:
+          REQUESTED_TARGETS: ${{ github.event.inputs.targets || 'esp32,esp32s2,esp32s3,esp32c2,esp32c3,esp32c5,esp32c6,esp32c61,esp32h2,esp32p4' }}
+        run: |
+          set -eu
+          # A manual subset is permitted for fast troubleshooting, but its
+          # output is diagnostic-only. It must not replace framework-latest.
+          python3 - "$REQUESTED_TARGETS" "$GITHUB_OUTPUT" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          canonical = {
+              "esp32", "esp32s2", "esp32s3", "esp32c2", "esp32c3",
+              "esp32c5", "esp32c6", "esp32c61", "esp32h2", "esp32p4",
+          }
+          raw = sys.argv[1]
+          items = [item.strip() for item in raw.split(",") if item.strip()]
+          if not items:
+              raise SystemExit("targets must contain at least one chip")
+          if any(not re.fullmatch(r"esp32[a-z0-9]*", item) for item in items):
+              raise SystemExit(f"invalid target list: {raw!r}")
+          if len(set(items)) != len(items):
+              raise SystemExit(f"duplicate chip in target list: {raw!r}")
+          unknown = set(items) - canonical
+          if unknown:
+              raise SystemExit(f"unsupported target(s): {sorted(unknown)}")
+
+          publish = "yes" if set(items) == canonical else "no"
+          out = Path(sys.argv[2])
+          with out.open("a", encoding="utf-8") as fp:
+              fp.write(f"targets={','.join(items)}\n")
+              fp.write(f"publish={publish}\n")
+          print(f"Build targets: {','.join(items)}")
+          if publish == "yes":
+              print("Complete target set: public releases may be updated.")
+          else:
+              print("Partial target set: only debug-run artifacts may be published.")
+          PY
+
+      - name: 读取上次构建的版本
+        id: last
+        run: |
+          if [ -f .last_build_versions ]; then
+            LAST_AR=$(grep '^arduino=' .last_build_versions | cut -d= -f2-)
+            LAST_IDF=$(grep '^idf=' .last_build_versions | cut -d= -f2-)
+            LAST_COMPLETE=$(grep '^complete=' .last_build_versions | cut -d= -f2-)
+          else
+            LAST_AR=""
+            LAST_IDF=""
+            LAST_COMPLETE=""
+          fi
+          echo "last_arduino=$LAST_AR" >> "$GITHUB_OUTPUT"
+          echo "last_idf=$LAST_IDF" >> "$GITHUB_OUTPUT"
+          echo "last_complete=$LAST_COMPLETE" >> "$GITHUB_OUTPUT"
+          echo "上次构建: arduino=$LAST_AR, idf=$LAST_IDF"
+
+      - name: 判断是否需要构建
+        id: should_build
+        run: |
+          # 手动触发时强制构建
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "手动触发，强制构建"
+            echo "build=yes" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # 定时触发时比对版本
+          CUR_AR="${{ steps.ver.outputs.arduino_version }}"
+          CUR_IDF="${{ steps.ver.outputs.idf_version }}"
+          LAST_AR="${{ steps.last.outputs.last_arduino }}"
+          LAST_IDF="${{ steps.last.outputs.last_idf }}"
+          LAST_COMPLETE="${{ steps.last.outputs.last_complete }}"
+          if [ "$LAST_COMPLETE" != "yes" ]; then
+            echo "Last recorded build is incomplete; rebuilding the full target set."
+            echo "build=yes" >> "$GITHUB_OUTPUT"
+          elif [ "$CUR_AR" != "$LAST_AR" ] || [ "$CUR_IDF" != "$LAST_IDF" ]; then
+            echo "上游有更新: arduino $LAST_AR → $CUR_AR, idf $LAST_IDF → $CUR_IDF"
+            echo "build=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "上游无更新: arduino=$CUR_AR, idf=$CUR_IDF"
+            echo "build=no" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 构建全部芯片静态库
+        if: steps.should_build.outputs.build == 'yes'
+        run: |
+          TARGETS="${{ steps.targets.outputs.targets }}"
+          IDF_BRANCH="${{ steps.ver.outputs.idf_branch }}"
+          IDF_COMMIT="${{ steps.ver.outputs.idf_version }}"
+          ARDUINO_BRANCH="${{ steps.ver.outputs.arduino_version }}"
+          echo "构建目标: $TARGETS"
+          echo "IDF 分支: $IDF_BRANCH"
+          echo "IDF 提交: $IDF_COMMIT"
+          echo "Arduino 版本: $ARDUINO_BRANCH"
+          cd /opt/esp/lib-builder
+          # GitHub Actions 注入的 GITHUB_TOKEN 只能访问当前仓库，无法访问
+          # espressif/arduino-esp32。config.sh 会用 GITHUB_TOKEN 拼
+          # AR_REPO_URL=https://<token>@github.com/espressif/arduino-esp32.git，
+          # 导致 clone 失败。unset 后 config.sh 回退到匿名 URL（公开仓库可匿名 clone）。
+          unset GITHUB_TOKEN
+          # 强制设为 espressif，使 AR_REPO_URL=https://github.com/espressif/arduino-esp32.git
+          export GITHUB_REPOSITORY_OWNER=espressif
+          export GITHUB_REPOSITORY=espressif/arduino-esp32
+          # 修复：install-arduino.sh 中 checkout -B "$AR_SOURCE_BRANCH" origin/"$AR_SOURCE_BRANCH"
+          # 仅对分支有效。当 -A 指定的是 tag（如 3.3.11）时，origin/3.3.11 不存在，
+          # 导致 "fatal: 'origin/3.3.11' is not a commit and a branch '3.3.11' cannot be created from it"。
+          # 补丁：fetch 加 --tags，checkout 改为直接检出（兼容 tag 和分支），移除 pull --ff-only（tag 无需 pull）。
+          sed -i 's|fetch --all|fetch --all --tags|' tools/install-arduino.sh
+          sed -i 's|checkout -B "$AR_SOURCE_BRANCH" origin/"$AR_SOURCE_BRANCH" && \\|checkout "$AR_SOURCE_BRANCH"|' tools/install-arduino.sh
+          sed -i '/pull --ff-only/d' tools/install-arduino.sh
+          echo "install-arduino.sh patched: tag checkout fix applied"
+          # 修复：TinyUSB commit a57f857 删除了 vendor_host.c（标注为 "remove the obsolete host vendor driver"），
+          # 但 lib-builder 的 arduino_tinyusb/CMakeLists.txt 仍引用该文件，导致 CMake 报错。
+          # 正确修复：从 CMakeLists.txt 中删掉对 vendor_host.c 的引用，而非 pin 旧版本。
+          sed -i '/vendor_host\.c/d' components/arduino_tinyusb/CMakeLists.txt
+          echo "CMakeLists.txt patched: removed vendor_host.c reference"
+          # ESP-IDF v5.5 默认使用 newlib。Arduino 3.3.11 的预编译库和
+          # pioarduino-build.py 使用 picolibc multilib；显式把配置追加到
+          # lib-builder 的公共 defconfig。build.sh 的额外参数只对 -b 非 all
+          # 构建生效，直接把 CONFIG_*=y 作为 build.sh 参数不会作用于默认的
+          # 全芯片构建，因此这里必须修改实际传给 idf.py 的 defconfig。
+          printf '%s\n' \
+            '# Required by the PioArduino multilib layout.' \
+            'CONFIG_IDF_EXPERIMENTAL_FEATURES=y' \
+            'CONFIG_LIBC_PICOLIBC=y' >> configs/defconfig.common
+          echo "defconfig.common patched: picolibc enabled"
+          # lib-builder release-v5.5 downloads espressif/cbor 0.6.1~4 during the Arduino-Libs build.
+          # Its Linux-only open_memstream implementation depends on glibc APIs that picolibc does not provide.
+          # Overlay the same component locally and disable the optional CBOR-to-JSON stream implementation.
+          CBOR_VERSION="0.6.1~4"
+          CBOR_URL="https://components-file.espressif.com/components/espressif/cbor/${CBOR_VERSION}/espressif__cbor-v0.6.1_4.zip"
+          curl -fsSL --retry 3 "$CBOR_URL" -o /tmp/espressif-cbor.zip
+          rm -rf components/cbor
+          mkdir -p components/cbor
+          python3 -c "import zipfile; zipfile.ZipFile('/tmp/espressif-cbor.zip').extractall('components/cbor')"
+          python3 - <<'PY'
+          from pathlib import Path
+          cmake = Path("components/cbor/CMakeLists.txt")
+          text = cmake.read_text(encoding="utf-8")
+          lines = text.splitlines(keepends=True)
+          output = []
+          skip = 0
+          for line in lines:
+              if skip:
+                  skip -= 1
+                  continue
+              if "tinycbor/src/open_memstream.c" in line:
+                  continue
+              if line.strip() == "# for open_memstream.c":
+                  skip = 3
+                  continue
+              output.append(line)
+          patched = "".join(output)
+          if "open_memstream.c" in patched or '__linux__' in patched:
+              raise SystemExit("cbor CMakeLists still contains the glibc open_memstream block")
+          if "target_compile_definitions(${COMPONENT_LIB} PRIVATE WITHOUT_OPEN_MEMSTREAM)" not in patched:
+              patched += "\ntarget_compile_definitions(${COMPONENT_LIB} PRIVATE WITHOUT_OPEN_MEMSTREAM)\n"
+          cmake.write_text(patched, encoding="utf-8")
+          PY
+          test -f components/cbor/CMakeLists.txt
+          grep -q 'WITHOUT_OPEN_MEMSTREAM' components/cbor/CMakeLists.txt
+          ! grep -Eq 'open_memstream\.c|__linux__' components/cbor/CMakeLists.txt
+          echo "Local cbor overlay patched: WITHOUT_OPEN_MEMSTREAM"
+          ./build.sh -t "$TARGETS" -I "$IDF_BRANCH" -i "$IDF_COMMIT" -A "$ARDUINO_BRANCH" -e
+      - name: 保存原始构建快照至release
+        # Save lib-builder output before any packaging or validation. This runs
+        # even when build.sh fails, so partial output remains inspectable.
+        if: always() && steps.should_build.outputs.build == 'yes'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          GITHUB_API="https://api.github.com"
+          REPO="${{ github.repository }}"
+          DEBUG_TAG="debug-run-${{ github.run_id }}"
+          RAW_DIR="/opt/esp/lib-builder/out/tools/esp32-arduino-libs"
+          ASSET_LIST="tools/raw-esp32-arduino-libs.assets.list"
+          # Keep each upload below GitHub's single-asset size limit (2 GiB).
+          # The helper compresses first and splits only when still necessary.
+          MAX_RAW_ASSET_BYTES=$((800 * 1024 * 1024))
+          if [ ! -d "$RAW_DIR" ]; then
+            echo "No lib-builder output exists; no raw snapshot to upload."
+            exit 0
+          fi
+          if [ -z "${GITHUB_TOKEN:-}" ]; then
+            echo "WARNING: GITHUB_TOKEN is not configured; skipping diagnostic snapshot." >&2
+            exit 0
+          fi
+
+          # This is diagnostic retention, not a release gate. A failed upload
+          # must never discard a successful multi-hour compilation result before
+          # packaging has a chance to create the usable PlatformIO artifacts.
+          if ! python3 tools/archive_raw_snapshot.py \
+            --source-dir "$RAW_DIR" \
+            --output-dir tools \
+            --asset-list "$ASSET_LIST" \
+            --max-part-bytes "$MAX_RAW_ASSET_BYTES"; then
+            echo "WARNING: could not create raw diagnostic snapshot; continuing." >&2
+            exit 0
+          fi
+          test -s "$ASSET_LIST" || {
+            echo "WARNING: raw diagnostic asset list is empty; continuing." >&2
+            exit 0
+          }
+          cat "$ASSET_LIST"
+
+          DEBUG_JSON=$(curl -fsS -H "Authorization: token ${GITHUB_TOKEN}" \
+            "${GITHUB_API}/repos/${REPO}/releases/tags/${DEBUG_TAG}" || echo "")
+          if [ "$(printf '%s' "$DEBUG_JSON" | grep -c '"id"')" -eq 0 ]; then
+            if ! DEBUG_JSON=$(curl -fsS -X POST -H "Authorization: token ${GITHUB_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{\"tag_name\":\"${DEBUG_TAG}\",\"target_commitish\":\"develop\",\"name\":\"Build snapshot ${DEBUG_TAG}\",\"body\":\"Raw post-build artifact. Diagnostic only; do not use as a PlatformIO release.\",\"draft\":false,\"prerelease\":true}" \
+              "${GITHUB_API}/repos/${REPO}/releases"); then
+              echo "WARNING: could not create debug release; continuing." >&2
+              exit 0
+            fi
+          fi
+          DEBUG_RELEASE_ID=$(printf '%s' "$DEBUG_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id", ""))' 2>/dev/null || true)
+          if [ -z "$DEBUG_RELEASE_ID" ]; then
+            echo "WARNING: debug release response has no id; continuing." >&2
+            exit 0
+          fi
+
+          OLD_ASSETS_JSON=$(curl -fsS -H "Authorization: token ${GITHUB_TOKEN}" \
+            "${GITHUB_API}/repos/${REPO}/releases/${DEBUG_RELEASE_ID}/assets" || echo '[]')
+          UPLOAD_FAILURES=0
+          while IFS= read -r ASSET_PATH || [ -n "$ASSET_PATH" ]; do
+            [ -n "$ASSET_PATH" ] || continue
+            if [ ! -f "$ASSET_PATH" ]; then
+              echo "WARNING: raw diagnostic asset is missing: $ASSET_PATH" >&2
+              UPLOAD_FAILURES=$((UPLOAD_FAILURES + 1))
+              continue
+            fi
+            ASSET_NAME=$(basename "$ASSET_PATH")
+            OLD_ASSET_ID=$(printf '%s' "$OLD_ASSETS_JSON" | python3 -c 'import json,sys; name=sys.argv[1]; print(next((str(a.get("id")) for a in json.load(sys.stdin) if a.get("name") == name), ""))' "$ASSET_NAME" 2>/dev/null || true)
+            if [ -n "$OLD_ASSET_ID" ]; then
+              if ! curl -fsS -X DELETE -H "Authorization: token ${GITHUB_TOKEN}" \
+                "${GITHUB_API}/repos/${REPO}/releases/assets/${OLD_ASSET_ID}" >/dev/null; then
+                echo "WARNING: could not replace old diagnostic asset: $ASSET_NAME" >&2
+                UPLOAD_FAILURES=$((UPLOAD_FAILURES + 1))
+                continue
+              fi
+            fi
+            if UPLOAD_JSON=$(curl -fsS -X POST -H "Authorization: token ${GITHUB_TOKEN}" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@${ASSET_PATH}" \
+              "${GITHUB_API}/repos/${REPO}/releases/${DEBUG_RELEASE_ID}/assets?name=${ASSET_NAME}"); then
+              if printf '%s' "$UPLOAD_JSON" | python3 -c 'import json,sys; expected=sys.argv[1]; data=json.load(sys.stdin); assert data.get("name") == expected, f"unexpected debug asset: {data!r}"' "$ASSET_NAME"; then
+                echo "Raw diagnostic asset uploaded: $ASSET_NAME"
+              else
+                echo "WARNING: GitHub returned an unexpected diagnostic asset response: $ASSET_NAME" >&2
+                UPLOAD_FAILURES=$((UPLOAD_FAILURES + 1))
+              fi
+            else
+              echo "WARNING: raw diagnostic upload failed for $ASSET_NAME; continuing." >&2
+              UPLOAD_FAILURES=$((UPLOAD_FAILURES + 1))
+            fi
+          done < "$ASSET_LIST"
+          if [ "$UPLOAD_FAILURES" -ne 0 ]; then
+            echo "WARNING: raw diagnostic upload was incomplete; continuing to package artifacts." >&2
+          else
+            echo "Raw build snapshot published to https://github.com/${REPO}/releases/tag/${DEBUG_TAG}"
+          fi
+
+      - name: 整理 PioArduino 静态库包
+        id: package
+        if: steps.should_build.outputs.build == 'yes'
+        run: |
+          set -eu
+          cd "$GITHUB_WORKSPACE"
+          rm -rf tools/esp32-arduino-libs
+          rm -rf tools/framework-arduinoespressif32-libs
+          test -d /opt/esp/lib-builder/out/tools/esp32-arduino-libs
+          cp -a /opt/esp/lib-builder/out/tools/esp32-arduino-libs tools/esp32-arduino-libs
+          # 基本文件检查（package.json 和 tools.json 由 lib-builder 生成）
+          test -f tools/esp32-arduino-libs/package.json
+          test -f tools/esp32-arduino-libs/tools.json
+          # 验证所有请求的芯片都编译成功（有 lib/ 子目录才算成功）
+          REQUESTED_TARGETS="${{ steps.targets.outputs.targets }}"
+          BUILT_CHIPS=""
+          MISSING_CHIPS=""
+          for chip in $(echo "$REQUESTED_TARGETS" | tr ',' ' '); do
+            chip_dir="tools/esp32-arduino-libs/$chip"
+            if [ -d "$chip_dir/lib" ]; then
+              echo "✅ $chip: lib/ 存在"
+              BUILT_CHIPS="$BUILT_CHIPS $chip"
+            else
+              echo "❌ $chip: lib/ 不存在"
+              MISSING_CHIPS="$MISSING_CHIPS $chip"
+            fi
+          done
+          # 所有请求的芯片都必须编译成功，否则构建失败
+          if [ -n "$MISSING_CHIPS" ]; then
+            echo "❌ 以下芯片编译失败:$MISSING_CHIPS"
+            echo "已编译的芯片:$BUILT_CHIPS"
+            exit 1
+          fi
+          echo "已编译的芯片:$BUILT_CHIPS"
+
+          # 防止错误产物进入 Release：校验实际 PioArduino metadata 中的
+          # picolibc specs，并拒绝 nano.specs 和构建容器绝对路径。
+          # 注意：ESP-IDF 的组件名仍为 newlib，即使实现已切换到 picolibc，
+          # 因此 -lnewlib 本身是正常的，不能作为失败条件。
+          # This rejects old artifacts like run 88, which used nano.specs and
+          # caused PlatformIO to select the wrong multilib during Xtensa linking.
+          # lib-builder should make specs paths toolchain-relative.  Some image
+          # revisions leave /opt/esp paths in generated metadata; normalize only
+          # picolibc specs (never nano.specs) before validating the package.
+          NORMALIZATION_LOG="tools/pio-specs-normalization.log"
+          python3 tools/normalize_pio_specs.py \
+            --libs-dir tools/esp32-arduino-libs \
+            --targets "$REQUESTED_TARGETS" >"$NORMALIZATION_LOG" 2>&1
+          cat "$NORMALIZATION_LOG"
+
+          # Keep this result as a diagnostic rather than stopping here.  The
+          # zip/framework archives are still generated for failed-run debugging.
+          PIO_VALIDATION_LOG="tools/pio-artifact-validation.log"
+          if python3 tools/validate_pio_libs.py \
+            --libs-dir tools/esp32-arduino-libs \
+            --targets "$REQUESTED_TARGETS" >"$PIO_VALIDATION_LOG" 2>&1; then
+            PIO_VALIDATION_STATUS=0
+          else
+            PIO_VALIDATION_STATUS=$?
+          fi
+          cat "$PIO_VALIDATION_LOG"
+
+          echo "arduino=${{ steps.ver.outputs.arduino_version }}" > .last_build_versions
+          echo "idf=${{ steps.ver.outputs.idf_version }}" >> .last_build_versions
+
+          # 打包预编译库为 zip（不提交进 git 仓库，避免 Windows 上 git clone 时
+          # 因超长路径（>260 字符）导致 checkout 失败）。
+          # asset 名固定为 esp32-arduino-libs.zip，platform.py 用 GitHub API 下载。
+          # 注意：lib-builder 容器没有 zip 命令（runs85 曾因 zip: not found 失败），
+          # 但确定有 python3，用 zipfile 打包。
+          ZIP_NAME="esp32-arduino-libs.zip"
+          echo "打包静态库: $ZIP_NAME"
+          # 用 python3 zipfile 打包（platform.py 用 zipfile 解压）。
+          # 注意：不加 ./ 前缀，直接打包当前目录内容，使 zip 内顶层为
+          # package.json / esp32/ / esp32c2/ 等，与 platform.py 期望一致。
+          cd tools/esp32-arduino-libs
+          # 用 python3 zipfile 打包（容器无 zip 命令，但确定有 python3）。
+          # 注意：脚本用单行写，避免破坏 YAML 块缩进。
+          python3 -c "import os, zipfile; src='.'; out='../esp32-arduino-libs.zip'; zf=zipfile.ZipFile(out,'w',zipfile.ZIP_DEFLATED,compresslevel=9); [zf.write(os.path.join(r,f), os.path.relpath(os.path.join(r,f),src).replace(os.sep,'/')) for r,ds,fs in os.walk(src) for f in fs]; [zf.writestr(zipfile.ZipInfo(os.path.relpath(os.path.join(r,d),src).replace(os.sep,'/')+'/'), '') for r,ds,fs in os.walk(src) for d in ds]; zf.close(); print('zip 打包完成')"
+          cd "$GITHUB_WORKSPACE"
+          ls -lh "tools/${ZIP_NAME}"
+          echo "zip_name=$ZIP_NAME" >> "$GITHUB_OUTPUT"
+
+          # ---- 组装并打包完整 framework 包 ----
+          # platform.json 的 framework-arduinoespressif32 包指向 GitHub Release 中的
+          # framework-arduinoespressif32.tar.xz。该包 = arduino-esp32 源码（3.3.11）
+          # + tools/pioarduino-build.py（已补丁）+ tools/esp32-arduino-libs/（编译好的库）。
+          echo "组装 framework 包..."
+          python3 tools/package_framework.py \
+            --arduino-src /opt/esp/lib-builder/components/arduino \
+            --libs-dir tools/esp32-arduino-libs \
+            --out-dir tools \
+            --arduino-version "${{ steps.ver.outputs.arduino_version }}" \
+            --idf-version "${{ steps.ver.outputs.idf_version }}"
+          echo "framework_name=framework-arduinoespressif32" >> "$GITHUB_OUTPUT"
+          ls -lh tools/framework-arduinoespressif32.tar.xz
+
+          # Final acceptance checks run before any Release API call.  Archives
+          # are intentionally produced before this point, so a rejected run can
+          # publish them to a dedicated debug Release for inspection.
+          if [ "$PIO_VALIDATION_STATUS" -ne 0 ]; then
+            echo "Raw PioArduino metadata validation failed; see $PIO_VALIDATION_LOG" >&2
+            exit "$PIO_VALIDATION_STATUS"
+          fi
+          if ! python3 tools/validate_pio_package.py \
+            --libs-dir tools/esp32-arduino-libs \
+            --libs-zip tools/esp32-arduino-libs.zip \
+            --framework-tar tools/framework-arduinoespressif32.tar.xz \
+            --targets "$REQUESTED_TARGETS" >>"$PIO_VALIDATION_LOG" 2>&1; then
+            cat "$PIO_VALIDATION_LOG" >&2
+            exit 1
+          fi
+          cat "$PIO_VALIDATION_LOG"
+
+      - name: 上传产物到 GitHub Release
+        # A subset build is diagnostic-only and must not overwrite releases.
+        if: steps.should_build.outputs.build == 'yes' && steps.targets.outputs.publish == 'yes'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          test -n "${GITHUB_TOKEN:-}" || { echo "GITHUB_TOKEN is not configured" >&2; exit 1; }
+          GITHUB_API="https://api.github.com"
+          REPO="${{ github.repository }}"
+          ZIP_NAME="${{ steps.package.outputs.zip_name }}"
+          AR_VER="${{ steps.ver.outputs.arduino_version }}"
+          IDF_VER="${{ steps.ver.outputs.idf_version }}"
+          TAG="libs-${AR_VER}-${IDF_VER}"
+          FRAMEWORK_NAME="${{ steps.package.outputs.framework_name }}"
+          # PlatformIO caches packages by URL. Use a new immutable URL for each
+          # complete run instead of replacing a file behind a fixed URL.
+          FRAMEWORK_ASSET_NAME="${FRAMEWORK_NAME}-${AR_VER}-${IDF_VER}-run${{ github.run_id }}.tar.xz"
+
+          # 2) 查询/创建 release（tag 不存在则创建）
+          RELEASE_JSON=$(curl -fsS -H "Authorization: token ${GITHUB_TOKEN}" \
+            "${GITHUB_API}/repos/${REPO}/releases/tags/${TAG}" || echo "")
+          if [ "$(echo "$RELEASE_JSON" | grep -c '"id"')" -eq 0 ]; then
+            echo "创建 release $TAG"
+            RELEASE_JSON=$(curl -fsS -X POST -H "Authorization: token ${GITHUB_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{\"tag_name\":\"${TAG}\",\"target_commitish\":\"develop\",\"name\":\"ESP32 Arduino Libs ${AR_VER} (IDF ${IDF_VER})\",\"body\":\"precompiled static libraries\",\"draft\":false,\"prerelease\":false}" \
+              "${GITHUB_API}/repos/${REPO}/releases")
+          fi
+          RELEASE_ID=$(echo "$RELEASE_JSON" | grep -oP '"id":\s*\K[0-9]+' | head -1)
+          test -n "$RELEASE_ID" || { echo "GitHub release response has no id" >&2; exit 1; }
+          echo "release_id=$RELEASE_ID"
+
+          # Publish a stable libs zip and an immutable framework archive.
+          # If this exact run is retried, replace only matching asset names.
+          for ASSET_NAME in "${ZIP_NAME}" "${FRAMEWORK_ASSET_NAME}"; do
+            echo "处理 asset: $ASSET_NAME"
+            # 用 assets API + JSON 解析查找旧 asset。不要依赖 GitHub 返回 JSON 的字段顺序。
+            ASSETS_JSON=$(curl -fsS -H "Authorization: token ${GITHUB_TOKEN}" \
+              "${GITHUB_API}/repos/${REPO}/releases/${RELEASE_ID}/assets")
+            ASSET_ID=$(echo "$ASSETS_JSON" | python3 -c "import sys,json; name='${ASSET_NAME}'; print(next((str(a.get('id')) for a in json.load(sys.stdin) if a.get('name') == name), ''))")
+            if [ -n "$ASSET_ID" ]; then
+              echo "删除旧 asset $ASSET_ID"
+              curl -fsS -X DELETE -H "Authorization: token ${GITHUB_TOKEN}" \
+                "${GITHUB_API}/repos/${REPO}/releases/assets/${ASSET_ID}"
+            fi
+
+            # 4) 上传新 asset
+            if [ "$ASSET_NAME" = "$FRAMEWORK_ASSET_NAME" ]; then
+              ASSET_PATH="tools/${FRAMEWORK_NAME}.tar.xz"
+            else
+              ASSET_PATH="tools/${ASSET_NAME}"
+            fi
+            test -f "$ASSET_PATH" || { echo "missing asset file: $ASSET_PATH" >&2; exit 1; }
+            echo "上传 $ASSET_NAME 到 release $RELEASE_ID"
+            UPLOAD_JSON=$(curl -fsS -X POST -H "Authorization: token ${GITHUB_TOKEN}" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@${ASSET_PATH}" \
+              "${GITHUB_API}/repos/${REPO}/releases/${RELEASE_ID}/assets?name=${ASSET_NAME}")
+            printf '%s' "$UPLOAD_JSON" | python3 -c 'import json,sys; expected=sys.argv[1]; data=json.load(sys.stdin); assert data.get("name") == expected, f"unexpected uploaded asset: {data!r}"' "$ASSET_NAME"
+          done
+          echo "✅ 已上传: https://github.com/${REPO}/releases/tag/${TAG}"
+
+          # Keep the framework-latest tag as the stable release container.
+          # platform.json will point at an immutable asset within this release.
+          FRAMEWORK_TAG="framework-latest"
+          FRAMEWORK_JSON=$(curl -fsS -H "Authorization: token ${GITHUB_TOKEN}" \
+            "${GITHUB_API}/repos/${REPO}/releases/tags/${FRAMEWORK_TAG}" || echo "")
+          if [ "$(echo "$FRAMEWORK_JSON" | grep -c '"id"')" -eq 0 ]; then
+            echo "创建固定 tag release $FRAMEWORK_TAG"
+            FRAMEWORK_JSON=$(curl -fsS -X POST -H "Authorization: token ${GITHUB_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{\"tag_name\":\"${FRAMEWORK_TAG}\",\"target_commitish\":\"develop\",\"name\":\"ESP32 Arduino Framework (latest)\",\"body\":\"complete Arduino framework package\",\"draft\":false,\"prerelease\":false}" \
+              "${GITHUB_API}/repos/${REPO}/releases")
+          fi
+          FRAMEWORK_RELEASE_ID=$(echo "$FRAMEWORK_JSON" | grep -oP '"id":\s*\K[0-9]+' | head -1)
+          test -n "$FRAMEWORK_RELEASE_ID" || { echo "framework-latest release response has no id" >&2; exit 1; }
+          echo "framework-latest release_id=$FRAMEWORK_RELEASE_ID"
+          # Query the existing immutable framework assets.
+          FRAMEWORK_ASSETS_JSON=$(curl -fsS -H "Authorization: token ${GITHUB_TOKEN}" \
+            "${GITHUB_API}/repos/${REPO}/releases/${FRAMEWORK_RELEASE_ID}/assets")
+          # Retain older immutable assets because previous platform commits may
+          # still reference them. Delete only an asset with this exact run name
+          # when the same workflow run is re-executed.
+          OLD_FW_ASSET_ID=$(echo "$FRAMEWORK_ASSETS_JSON" | python3 -c "import sys,json; name='${FRAMEWORK_ASSET_NAME}'; print(next((str(a.get('id')) for a in json.load(sys.stdin) if a.get('name') == name), ''))")
+          if [ -n "$OLD_FW_ASSET_ID" ]; then
+            echo "Deleting retry asset $OLD_FW_ASSET_ID"
+            curl -fsS -X DELETE -H "Authorization: token ${GITHUB_TOKEN}" \
+              "${GITHUB_API}/repos/${REPO}/releases/assets/${OLD_FW_ASSET_ID}"
+          fi
+          echo "Uploading immutable framework asset to framework-latest: $FRAMEWORK_ASSET_NAME"
+          FRAMEWORK_UPLOAD_JSON=$(curl -fsS -X POST -H "Authorization: token ${GITHUB_TOKEN}" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary "@tools/${FRAMEWORK_NAME}.tar.xz" \
+            "${GITHUB_API}/repos/${REPO}/releases/${FRAMEWORK_RELEASE_ID}/assets?name=${FRAMEWORK_ASSET_NAME}")
+          printf '%s' "$FRAMEWORK_UPLOAD_JSON" | python3 -c 'import json,sys; expected=sys.argv[1]; data=json.load(sys.stdin); assert data.get("name") == expected, f"unexpected uploaded asset: {data!r}"' "$FRAMEWORK_ASSET_NAME"
+          FRAMEWORK_FINAL_ASSETS_JSON=$(curl -fsS -H "Authorization: token ${GITHUB_TOKEN}" \
+            "${GITHUB_API}/repos/${REPO}/releases/${FRAMEWORK_RELEASE_ID}/assets")
+          printf '%s' "$FRAMEWORK_FINAL_ASSETS_JSON" | python3 -c 'import json,sys; expected=sys.argv[1]; names={a.get("name") for a in json.load(sys.stdin)}; assert expected in names, f"framework release asset missing: {expected}"' "$FRAMEWORK_ASSET_NAME"
+
+          # Verify both assets are visible from the Release API after upload.
+          FINAL_ASSETS_JSON=$(curl -fsS -H "Authorization: token ${GITHUB_TOKEN}" \
+            "${GITHUB_API}/repos/${REPO}/releases/${RELEASE_ID}/assets")
+          printf '%s' "$FINAL_ASSETS_JSON" | python3 -c 'import json,sys; required=set(sys.argv[1:]); names={a.get("name") for a in json.load(sys.stdin)}; missing=required-names; assert not missing, f"release assets missing: {sorted(missing)}"' "$ZIP_NAME" "$FRAMEWORK_ASSET_NAME"
+
+          # Point platform.json to the immutable, verified framework asset. A
+          # changed URL forces PlatformIO to avoid its fixed-URL package cache.
+          FRAMEWORK_URL="https://github.com/${REPO}/releases/download/${FRAMEWORK_TAG}/${FRAMEWORK_ASSET_NAME}"
+          python3 - "$FRAMEWORK_URL" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          path = Path("platform.json")
+          data = json.loads(path.read_text(encoding="utf-8"))
+          data["packages"]["framework-arduinoespressif32"]["version"] = sys.argv[1]
+          path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+          PY
+          grep -F "$FRAMEWORK_URL" platform.json
+
+          # Record completion only after every asset has been uploaded and verified.
+          # A failed or partial publication must remain eligible for a full retry.
+          echo "complete=yes" >> .last_build_versions
+          git config --global user.name "ci-bot"
+          git config --global user.email "ci-bot@localhost"
+          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git"
+          git add .last_build_versions platform.json
+          git commit -m "chore: publish framework package" || echo "no version changes"
+          git push origin HEAD:develop
+
+          echo "✅ 已更新: https://github.com/${REPO}/releases/tag/${FRAMEWORK_TAG}"
+
+      - name: 发布失败则保存诊断数据
+        if: failure() && steps.should_build.outputs.build == 'yes'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          test -n "${GITHUB_TOKEN:-}" || { echo "GITHUB_TOKEN is not configured" >&2; exit 1; }
+          GITHUB_API="https://api.github.com"
+          REPO="${{ github.repository }}"
+          DEBUG_TAG="debug-run-${{ github.run_id }}"
+
+          # Compilation output is normally removed with the job container.  If
+          # packaging reached any archive/log output, retain it in an isolated
+          # debug release.  It never updates libs-* or framework-latest.
+          HAS_DEBUG_ASSET=no
+          for ASSET_PATH in \
+            tools/esp32-arduino-libs.zip \
+            tools/framework-arduinoespressif32.tar.xz \
+            tools/pio-artifact-validation.log \
+            tools/pio-specs-normalization.log; do
+            if [ -f "$ASSET_PATH" ]; then
+              HAS_DEBUG_ASSET=yes
+            fi
+          done
+          if [ "$HAS_DEBUG_ASSET" != yes ]; then
+            echo "No package artifact was created; nothing to retain."
+            exit 0
+          fi
+
+          DEBUG_JSON=$(curl -fsS -H "Authorization: token ${GITHUB_TOKEN}" \
+            "${GITHUB_API}/repos/${REPO}/releases/tags/${DEBUG_TAG}" || echo "")
+          if [ "$(printf '%s' "$DEBUG_JSON" | grep -c '"id"')" -eq 0 ]; then
+            DEBUG_JSON=$(curl -fsS -X POST -H "Authorization: token ${GITHUB_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{\"tag_name\":\"${DEBUG_TAG}\",\"target_commitish\":\"develop\",\"name\":\"Build snapshot ${DEBUG_TAG}\",\"body\":\"Diagnostic artifacts only. Do not use as a PlatformIO release.\",\"draft\":false,\"prerelease\":true}" \
+              "${GITHUB_API}/repos/${REPO}/releases")
+          fi
+          DEBUG_RELEASE_ID=$(printf '%s' "$DEBUG_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id", ""))')
+          test -n "$DEBUG_RELEASE_ID" || { echo "debug release response has no id" >&2; exit 1; }
+
+          for ASSET_PATH in \
+            tools/esp32-arduino-libs.zip \
+            tools/framework-arduinoespressif32.tar.xz \
+            tools/pio-artifact-validation.log \
+            tools/pio-specs-normalization.log; do
+            [ -f "$ASSET_PATH" ] || continue
+            ASSET_NAME=$(basename "$ASSET_PATH")
+            UPLOAD_JSON=$(curl -fsS -X POST -H "Authorization: token ${GITHUB_TOKEN}" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@${ASSET_PATH}" \
+              "${GITHUB_API}/repos/${REPO}/releases/${DEBUG_RELEASE_ID}/assets?name=${ASSET_NAME}")
+            printf '%s' "$UPLOAD_JSON" | python3 -c 'import json,sys; expected=sys.argv[1]; data=json.load(sys.stdin); assert data.get("name") == expected, f"unexpected debug asset: {data!r}"' "$ASSET_NAME"
+          done
+          echo "Diagnostic artifacts published to https://github.com/${REPO}/releases/tag/${DEBUG_TAG}"

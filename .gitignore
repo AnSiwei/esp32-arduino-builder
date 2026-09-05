@@ -1,0 +1,30 @@
+# Python bytecode and local caches
+*.pyc
+*.pyo
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# PlatformIO and local build output
+.pio/
+.platformio/
+builder/build_lib/
+
+# Logs and local diagnostics
+*.log
+
+# Generated precompiled libraries and package archives
+# These files contain very long paths and must not be committed.
+tools/esp32-arduino-libs/
+tools/esp32-arduino-libs.zip*
+tools/raw-esp32-arduino-libs.zip*
+tools/raw-esp32-arduino-libs.assets.list
+tools/framework-arduinoespressif32/
+tools/framework-arduinoespressif32.tar.xz
+tools/_verify_tmp/
+
+# Local-only repair/test helpers
+tools/_fix_installed.py
+tools/_test_patch.py
+tools/test_package_local.py
