@@ -40,11 +40,10 @@ jobs:
       IDF_COMPONENT_API_TIMEOUT: "120"
     steps:
       - name: 检出平台仓库
-        run: |
-          git init
-          git remote add origin https://github.com/AnSiwei/esp32-arduino-builder.git
-          git fetch origin develop
-          git checkout -b develop origin/develop
+        uses: actions/checkout@v4
+        with:
+          ref: develop
+          fetch-depth: 0
 
       - name: 解析版本
         id: ver
