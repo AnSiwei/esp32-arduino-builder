@@ -29,6 +29,10 @@ import urllib.error
 import urllib.request
 
 GITHUB_API = "https://api.github.com"
+# 上传 release asset 必须使用 uploads.github.com 域名（api.github.com 会返回 404）。
+# 参考 GitHub 文档：Upload a release asset 端点使用 Hypermedia 关系，
+# 实际 URL 是 https://uploads.github.com/repos/{owner}/{repo}/releases/{release_id}/assets
+GITHUB_UPLOADS_API = "https://uploads.github.com"
 
 
 def api(url: str, token: str, method: str = "GET", data: dict | None = None,
@@ -100,7 +104,8 @@ def upload_asset(repo: str, token: str, release_id: int, path: str):
             api(f"{GITHUB_API}/repos/{repo}/releases/assets/{a['id']}", token, method="DELETE")
     with open(path, "rb") as fp:
         data = fp.read()
-    url = f"{GITHUB_API}/repos/{repo}/releases/{release_id}/assets?name={name}"
+    # 必须用 uploads.github.com 域名，否则 404
+    url = f"{GITHUB_UPLOADS_API}/repos/{repo}/releases/{release_id}/assets?name={name}"
     return api(url, token, method="POST", raw_body=data, content_type="application/octet-stream")
 
 
