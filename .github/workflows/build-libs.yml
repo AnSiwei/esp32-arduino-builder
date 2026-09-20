@@ -414,6 +414,24 @@ jobs:
           fi
           cat "$PIO_VALIDATION_LOG"
 
+      - name: 上传打包产物到 debug-run release
+        run: |
+          set -eu
+          test -n "${GITHUB_TOKEN:-}" || { echo "GITHUB_TOKEN is not configured" >&2; exit 1; }
+          DEBUG_TAG="debug-run-${{ github.run_id }}"
+          # 把打包产物上传到 debug-run release，供 publish job 下载。
+          # framework 包较大（~350MB），用 Release 存储（无硬性限制）而非
+          # artifact（免费账号配额小）。
+          for f in tools/esp32-arduino-libs.zip tools/framework-arduinoespressif32.tar.xz; do
+            test -f "$f" || { echo "missing package file: $f" >&2; exit 1; }
+            python3 tools/release_io.py upload \
+              --repo "${{ github.repository }}" \
+              --token "$GITHUB_TOKEN" \
+              --tag "$DEBUG_TAG" \
+              --file "$f"
+          done
+          echo "✅ 打包产物已上传到 $DEBUG_TAG"
+
   # 发布 job：上传产物到正式 release，并清理旧版本（只保留最新两个）。
   publish:
     needs: [prepare, package]
@@ -428,6 +446,31 @@ jobs:
         with:
           ref: develop
           fetch-depth: 0
+
+      - name: 下载打包产物
+        run: |
+          set -eu
+          test -n "${GITHUB_TOKEN:-}" || { echo "GITHUB_TOKEN is not configured" >&2; exit 1; }
+          DEBUG_TAG="debug-run-${{ github.run_id }}"
+          mkdir -p /tmp/packages
+          python3 tools/release_io.py download \
+            --repo "${{ github.repository }}" \
+            --token "$GITHUB_TOKEN" \
+            --tag "$DEBUG_TAG" \
+            --prefix "esp32-arduino-libs.zip" \
+            --out-dir /tmp/packages
+          python3 tools/release_io.py download \
+            --repo "${{ github.repository }}" \
+            --token "$GITHUB_TOKEN" \
+            --tag "$DEBUG_TAG" \
+            --prefix "framework-arduinoespressif32.tar.xz" \
+            --out-dir /tmp/packages
+          ls -lh /tmp/packages
+          # 放到 publish 步骤期望的 tools/ 路径下
+          mkdir -p tools
+          cp /tmp/packages/esp32-arduino-libs.zip tools/
+          cp /tmp/packages/framework-arduinoespressif32.tar.xz tools/
+          ls -lh tools/
 
       - name: 上传产物到 GitHub Release
         run: |
