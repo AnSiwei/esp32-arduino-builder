@@ -33,7 +33,7 @@
       "type": "framework",
       "optional": true,
       "owner": "AnSiwei",
-      "version": "https://github.com/AnSiwei/esp32-arduino-builder/releases/download/framework-latest/framework-arduinoespressif32-3.3.11-v5.5.5-run112.tar.xz"
+      "version": "https://github.com/AnSiwei/esp32-arduino-builder/releases/download/framework-latest/framework-arduinoespressif32-3.3.12-v5.5.5-run35527601302.tar.xz"
     },
     "framework-espidf": {
       "type": "framework",
