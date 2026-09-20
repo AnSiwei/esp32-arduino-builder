@@ -18,7 +18,7 @@ framework = arduino
 ┌────────────────────────────────────────────────────────────────┐
 │ GitHub (github.com)            AnSiwei/esp32-arduino-builder   │
 │                                                                │
-│  .github/workflows/build-libs.yml  定时构建（每日 02:00）        │
+│  .github/workflows/build-libs.yml  定时构建（每周一 02:00）      │
 │  platform.json                     平台清单（framework 指向固定 │
 │                                    URL 的 Release asset）       │
 │  platform.py + builder/            平台安装/构建逻辑             │
@@ -29,51 +29,78 @@ framework = arduino
 │   ├─ libs-<arduino>-<idf>     esp32-arduino-libs.zip           │
 │   │                           framework-arduinoespressif32.tar.xz
 │   ├─ framework-latest         固定名 framework 包 + 指纹文件     │
-│   └─ debug-run-<id>           失败构建的诊断快照（prerelease）    │
+│   └─ debug-run-<id>           中间产物存储（chip-*.tar.gz）      │
 └────────────────────────────────────────────────────────────────┘
           │ GitHub Actions runner（Docker: esp32-arduino-lib-builder 镜像）
           ▼
-   lib-builder 编译 10 个芯片 → 打包 → 校验 → 发布
+   prepare → build（10 芯片并行）→ package → publish
 ```
 
 ## 构建流水线（build-libs.yml）
 
-1. **解析版本**：`git ls-remote` 取 `espressif/arduino-esp32` 最新 tag；
+Workflow 拆分为 **4 个 job**，各芯片并行编译，避免单个 job 超过免费账号
+6 小时超时上限：
+
+```
+prepare ──► build（matrix: 每芯片一个并行 job）──► package ──► publish
+   │              │                                    │            │
+   │              └─ 上传 chip-<chip>.tar.gz           │            └─ 上传正式 release
+   │                到 debug-run-<run_id>              │                + 清理旧版本
+   └─ 解析版本/目标/增量判断                            └─ 下载合并 → 校验 → 打包
+```
+
+1. **prepare**：`git ls-remote` 取 `espressif/arduino-esp32` 最新 tag；
    从该 release 页面标题提取配套 ESP-IDF 版本（如 `3.3.11 → v5.5.5`）。
    支持手动触发时指定 `targets` / `arduino_version` / `idf_version`。
-2. **增量判断**：与 `.last_build_versions`（提交在仓库里）比对 arduino/idf
-   版本；上次构建未完成（`complete != yes`）时强制重跑。手动触发总是构建。
-3. **编译**：lib-builder 容器内 `build.sh` 一次编译全部目标芯片。
-   构建前自动打多个补丁（见下文「CI 补丁清单」）。
-4. **诊断快照**：无论编译成败，把 lib-builder 原始输出归档上传到
-   `debug-run-<run_id>` prerelease（分卷 ≤800MB），失败也可排查。
-5. **打包与校验**：
+   与 `.last_build_versions`（提交在仓库里）比对 arduino/idf 版本做增量判断；
+   上次构建未完成（`complete != yes`）时强制重跑。手动触发总是构建。
+2. **build**：matrix 并行 job，每个芯片独立编译（`timeout-minutes: 350`）。
+   构建前自动打多个补丁（见下文「CI 补丁清单」）。产物打包为
+   `chip-<chip>.tar.gz` 上传到 `debug-run-<run_id>` release 作为中间存储
+   （免费账号 artifact 配额小，而 Release 存储无硬性限制）。
+3. **package**：下载所有芯片产物，合并成完整 `esp32-arduino-libs/`，
+   校验所有请求的芯片都编译成功，然后：
    - `normalize_pio_specs.py` 规范化 picolibc specs 路径；
    - `validate_pio_libs.py` / `validate_pio_package.py` 拒绝 nano.specs、
      构建容器绝对路径等错误产物；
    - `package_framework.py` 组装完整 framework 包（arduino 源码 +
      补丁后的 `pioarduino-build.py` + 全芯片 libs）并生成指纹文件。
-6. **正式发布**（仅当构建了完整芯片集时）：
+4. **publish**（仅当构建了完整芯片集时）：
    - `libs-<arduino>-<idf>` release：`esp32-arduino-libs.zip` +
-     `framework-arduinoespressif32.tar.xz`（**固定名覆盖上传**）；
-   - `framework-latest` release：固定名 framework 包 +
+     `framework-arduinoespressif32.tar.xz`（**不可变名上传**，含 run_id）；
+   - `framework-latest` release：不可变名 framework 包 +
      `framework-fingerprint.json` 指纹（platform.py 增量检测用）；
-   - 清理 release 内所有历史 asset，只保留当前构建；
-   - `platform.json` 指向固定 URL，内容无变化时不产生 git 提交；
-   - 写入 `.last_build_versions`（含 `complete=yes`）提交回 develop。
+   - `platform.json` 指向不可变 URL（含 run_id），URL 变化强制 PlatformIO
+     绕过固定 URL 缓存；
+   - 写入 `.last_build_versions`（含 `complete=yes`）提交回 develop；
+   - **清理旧版本**：`cleanup_releases.py --keep 2` 只保留最新 2 个
+     `libs-*` release、framework-latest 的旧 assets，并删除所有
+     `debug-run-*` 中间 release。
 
-### 发布新鲜度机制（固定 URL + 指纹比对）
+> **上传域名**：GitHub Release asset 上传必须用 `uploads.github.com`
+> （`api.github.com` 会返回 404）。workflow 与 `tools/release_io.py` 均已
+> 使用 `GITHUB_UPLOADS_API`。
+
+### 发布新鲜度机制（不可变 URL + 指纹兜底）
 
 PlatformIO 对 URL 包有「同 URI 跳过重装」和「30 天下载缓存」两个行为，
-因此固定 URL 不会自动拿到新构建。解决方式：
+因此固定 URL 不会自动拿到新构建。当前采用**不可变 URL** 为主：
 
-- 每次构建生成 `framework-fingerprint.json`（含 arduino/idf 版本 + 日期 +
-  sha256 短指纹），上传到 `framework-latest`；
-- `platform.py` 的 `_ensure_framework_fresh()` 在每次构建前下载该小文件，
-  与本地缓存指纹比对；**不一致则清除 PM 下载缓存并卸载已装 framework 包**，
-  强制重新下载新产物。用户无需任何手动操作。
+- 每次构建的 framework 包以**不可变名**上传（含 run_id，如
+  `framework-arduinoespressif32-3.3.11-v5.5.5-run123.tar.xz`）；
+- `platform.json` 的 `framework-arduinoespressif32.version` 指向该不可变
+  URL。URL 每次变化，PlatformIO 会因 URI 不同而强制重新下载，天然绕过
+  固定 URL 缓存，用户无需任何手动操作；
+- 旧版本 framework 包保留在 `framework-latest` release 中（清理脚本只删
+  最旧的），因为历史 `platform.json` 提交可能仍引用它们。
 
-## CI 补丁清单（build-libs.yml 内置）
+**指纹兜底**：`platform.py` 的 `_ensure_framework_fresh()` 仍保留指纹比对
+逻辑（`framework-fingerprint.json`），作为 URL 未变化时的二次校验；指纹
+文件不可用时优雅降级，不影响构建。
+
+## CI 补丁清单（tools/prepare-build.sh 内置）
+
+构建前由 `tools/prepare-build.sh` 统一打补丁（每个芯片 job 都会调用）：
 
 | 补丁 | 原因 |
 |------|------|
@@ -162,6 +189,12 @@ framework = arduino
   纯 ASCII；Windows PowerShell 调 `curl.exe` 传中文参数会因 GBK 转换损坏
   （必须用中文时把 JSON 写成 UTF-8 文件再 `-d @file.json`）。
 - **lib-builder 容器无 zip 命令**，打包统一用 `python3 zipfile`。
-- **部分芯片手动构建**（targets 子集）只产出诊断快照，
+- **免费账号限制**：单 job 超时上限 6 小时（已通过拆分并行 job 规避，
+  build job 设 `timeout-minutes: 350`）；每月 Actions 分钟数/次数有限，
+  故定时构建改为**每周一 02:00** 执行一次。
+- **版本保留**：`cleanup_releases.py --keep 2` 只保留最新 2 个 `libs-*`
+  release，并删除所有 `debug-run-*` 中间 release，控制 Release 存储占用。
+- **部分芯片手动构建**（targets 子集）只产出 `debug-run-*` 中间产物，
   不会覆盖正式 release，防止残缺产物污染平台。
-- 上游 arduino-esp32 更新后最多延迟 24 小时自动编译。
+- **上传域名**：Release asset 上传必须用 `uploads.github.com`，否则 404。
+- 上游 arduino-esp32 更新后最多延迟一周自动编译（每周一检查）。

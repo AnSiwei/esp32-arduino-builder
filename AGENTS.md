@@ -7,10 +7,10 @@
 
 - **平台层**：`platform.py`（`Espressif32Platform` 类）、`platform.json`（包/工具链定义）
 - **构建脚本**：`builder/frameworks/arduino.py`（加载 framework 包内的 `tools/pioarduino-build.py`）
-- **CI/CD**：`.github/workflows/build-libs.yml`（GitHub Actions，每日 02:00 轮询 + 手动触发）
+- **CI/CD**：`.github/workflows/build-libs.yml`（GitHub Actions，每周一 02:00 轮询 + 手动触发；4 个 job：prepare/build/package/publish）
 - **板子定义**：`boards/*.json`（保留 Espressif、M5Stack、Seeed Studio 等主流板子定义）
 - **编译产物**：打包为 `framework-arduinoespressif32.tar.xz` 与 `esp32-arduino-libs.zip` 发布到 **GitHub Release**（不提交进 git 仓库）
-- **打包/校验工具**：`tools/` 下的 `package_framework.py`、`normalize_pio_specs.py`、`validate_pio_package.py` 等
+- **打包/校验工具**：`tools/` 下的 `package_framework.py`、`normalize_pio_specs.py`、`validate_pio_package.py`、`release_io.py`（Release 上传/下载/删除）、`cleanup_releases.py`（只保留最新 N 个版本）、`prepare-build.sh`（构建前统一打补丁）等
 
 详细架构说明见 [README.md](README.md)。
 
@@ -19,8 +19,8 @@
 ### Framework 整包分发与新鲜度检测
 
 1. **整包架构**：CI 将 arduino-esp32 源码 + 补丁后的 `pioarduino-build.py` + 全芯片静态库（`tools/esp32-arduino-libs/<chip>/`）组装为单一 `framework-arduinoespressif32.tar.xz`，发布到 GitHub Release（固定 tag `framework-latest`）。
-2. **固定 URL**：`platform.json` 中的 `framework-arduinoespressif32.version` 始终指向固定的 Release 下载链接，不再频繁产生 git 提交。
-3. **强缓存绕过（指纹机制）**：PlatformIO 默认对相同 URL 的包只比对 URI 并跳过重新下载。为确保新构建能推送到用户端，CI 同时上传 `framework-fingerprint.json`。`platform.py` 的 `_ensure_framework_fresh()` 在每次构建前检查该指纹，发生变化时自动清除 PlatformIO 下载缓存并强制重新安装 framework 包。
+2. **不可变 URL（主机制）**：每次构建的 framework 包以**不可变名**上传（含 run_id，如 `framework-arduinoespressif32-3.3.11-v5.5.5-run123.tar.xz`），`platform.json` 的 `framework-arduinoespressif32.version` 指向该不可变 URL。URL 每次变化，PlatformIO 因 URI 不同而强制重新下载，天然绕过固定 URL 缓存。
+3. **指纹兜底**：`platform.py` 的 `_ensure_framework_fresh()` 仍保留 `framework-fingerprint.json` 比对逻辑，作为 URL 未变化时的二次校验；指纹文件不可用时优雅降级，不影响构建。
 
 > 注意：预编译库**不能**提交进 git 仓库——其中包含超长路径文件
 > （如 Matter/connectedhomeip 头文件路径 >260 字符），会导致 Windows 上
@@ -77,7 +77,17 @@
    espressif/cbor 0.6.1~4 的 Linux open_memstream 依赖 glibc。
    **必须本地覆盖 cbor 并定义 `WITHOUT_OPEN_MEMSTREAM`**。
 
-7. **编译耗时较长**（10 个芯片约 35~45 分钟），`timeout-minutes: 1440`。
+7. **编译耗时较长**：workflow 已拆分为 4 个 job（prepare/build/package/publish），
+   每个芯片一个并行 build job（`timeout-minutes: 350`），规避免费账号单 job
+   6 小时超时上限。中间产物经 `debug-run-<run_id>` release 传递（免费账号
+   artifact 配额小，而 Release 存储无硬性限制）。
+
+8. **Release asset 上传必须用 `uploads.github.com`**：`api.github.com` 的
+   `/releases/{id}/assets` 会返回 404。workflow 用 `GITHUB_UPLOADS_API`，
+   `tools/release_io.py` 用 `GITHUB_UPLOADS_API` 常量。
+
+9. **版本保留**：`cleanup_releases.py --keep 2` 只保留最新 2 个 `libs-*`
+   release、framework-latest 的旧 assets，并删除所有 `debug-run-*` 中间 release。
 
 ### 验证组合
 
